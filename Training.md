@@ -1648,7 +1648,7 @@ Layer@frameworks/native/services/surfaceflinger/Layer.cpp
 Layer::Layer(SurfaceFlinger* flinger, const sp<Client>& client, const String8& name,       uint32_t w, uint32_t h, uint32_t flags) {
     ...
     /**
-     * 有点像OpenGL ES的操作, 设计SurfaceFlinger更细节的东西, 所以后面再深究
+     * 有点像OpenGL ES的操作, 涉及SurfaceFlinger更细节的东西, 所以后面再深究
      **/
     mFlinger->getRenderEngine().genTextures(1, &mTextureName);
     mTexture.init(Texture::TEXTURE_EXTERNAL, mTextureName);
