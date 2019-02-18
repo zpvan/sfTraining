@@ -227,29 +227,122 @@ Consumer的主体flow
 
 <img src="./data/vsync-handle-begin.png" style="zoom:100%">
 
-### handleMessageTranscation 安排业务
+### handleMessageTranscation
+
+通过每个Layer的mDrawingState与mCurrentState确定可视区域的内容是否"脏"了, mVisibleRegionsDirty
+
+通过Layer的移除将hw的脏区域"或大"点, hw->dirtyRegion.orSelf(dirty)
+
+主要步骤:
+
+* 遍历mCurrentState.layersSortedByZ, 为每个Layer做layer->doTransaction(0), Layer会用将所有set操作的结果(也就是mCurrentState)与mDrawingState作比较, 如果有差异, 就返回eVisibleRegion, 并且更新mDrawingState  (Layer的State主要包括Geometry, z, layerStack, alpha, flags等, 如果外面有对这些参数有做修改, 就会影响到mCurrentState改变, 就与mDrawingState有差异, 从而认为需要redraw) 
+* 处理显示屏幕有添加或移除的情况, 一般情况都遇不到, box的HDMI也不会触发这里
+* 遍历mCurrentState.layersSortedByZ, 根据每个Layer的layerStack来找到对应的DisplayDevice hw, 根据hw的默认旋转方向, 更新给Layer的mSurfaceFlingerConsumer
+* 处理有Layer被移除的情况(通过调用SurfaceFlinger::removeLayer来移除的), 通过遍历mDrawingState.layersSortedByZ的每个Layer去找它在currentLayers里边的位置, 如果index < 0, 说明改layer已经被移除,  那么就应该有新的内容被暴露出来, 我们将该layer经过转换后的active位置认为是dirtyRegion, 把这块dirtyRegion给到该layer的layerStack对应的DisplayDevice hw, 告诉他, 他的脏区域要或上这块dirtyRegion  (这步处理完, 我们就知道每个DisplayDevice的脏区域位置了)
+* 遍历mLayersPendingRemoval的每个Layer, 并通知他们已经被移除了onRemoved(), 且清空mLayersPendingRemoval, 最后用SF的mCurrentState为mDrawingState赋值
 
 
 
-### handleMessageInvalidate 挑选数据
+### handleMessageInvalidate
+
+结合Layer新queued的frame, 更新DisplayDevice的dirtyRegion
+
+主要步骤:
+
+* 遍历mDrawingState.layersSortedByZ, 调用每个Layer的hasQueuedFrame和shouldPresentNow, 找出有需要更新内容的Layer, 将它们放入layersWithQueuedFrames这个Vector里边 (先进后出, 栈?)
+* 遍历layersWithQueuedFrames, 调用每个Layer的latchBuffer( 后面详细分析 )获取dirtyRegion, 然后对他们对应的DisplayDeivce hw做脏区域或处理, invalidateLayerStack(s.layerStack, dirty);
+* 如果frameQueued还未到时机去显示的, 这里就要求收听下一次VSYNC
 
 
 
-### handleMessageRefresh 刷新数据
+#### Layer::latchBuffer
+
+acquiredNewBuffer, 创建eglImage, 更新surfaceFlingerConsumer的变量, releaseOldBuffer, 返回dirtyRegion
+
+主要步骤:
+
+* 调用mSurfaceFlingerConsumer->updateTexImage去acquiredBuffer, 利用拿到的BufferItem来创建EglImageKHR, 在release老的buffer, 也就是mCurrentTexture对应的buffer, 最后更新mCurrentTexture和相关成员变量
+* 计算dirtyRegion并返回
+
+
+
+### handleMessageRefresh 合成与渲染
+
+
+
+主要步骤:
+
+* preComposition(), 遍历mDrawingState.layersSortedByZ, 调用每个Layer的onPreComposition(), 检查是否需要接收下个VSYNC
+* rebuildLayerStacks(), 重整每个DisplayDevice对应的Layer, 并且为每个DisplayDevice hw设置VisibleLayersSortedByZ和undefinedRegion, 同时也更新一下dirtyRegion
+* setUpHWComposer() ( 后面详细分析 )
+* doComposition() ( 后面详细分析 )
+* postComposition(), 遍历mDrawingState.layersSortedByZ, 调用每个Layer的onPostComposition()
+
+
+
+#### setUpHWComposer
+
+要显示Layer已经被SF整理出来了, 但是还没给到HWC, HWC需要建立工作列表workList, 表的每个元素就是对应每个Layer, 最后一个元素是HWC_FRAMEBUFFER_TARGET合成类型的
+
+主要步骤:
+
+* 获取DisplayDevice需要被显示的Layer集合, hw->getVisibleLayersSortedByZ()
+* 创建workList, hwc.createWorkList(id, count), 会比VisibleLayers要多一个元素, 最后一个是特殊的, 合成类型是HWC_FRAMEBUFFER_TARGET
+* 遍历hw->getVisibleLayersSortedByZ(), 调用每个Layer的setGeometry为hwc的workList的每个元素赋值, 除了最后一个
+* 遍历hw->getVisibleLayersSortedByZ(), 调用每个Layer的setPerFrameData, 为workList的每个元素赋值图像内容mActiveBuffer
+* hwc.prepare(), 调用hwc的HAL模块prepare钩子方法
+* 遍历hw->getVisibleLayersSortedByZ(), 调用每个Layer的UpdateConsumerUsageBits去更新对应consumer的usage
+
+
+
+#### doComposition
+
+真正地去合成
+
+主要步骤:
+
+* doDisplayComposition(hw, dirtyRegion) ( 后面详细分析 )
+* 清除hw的dirtyRegion, flip掉hw的swapRegion, 也就是渲染合成完的图像, 也就是dequeueSfBuffer和queueSfBuffer, 等待消费者去消费了, 清除hw的swapRegion
+* 通知DisplayDevice合成已经完成, hw->compositionComplete()
+* postFramebuffer(), 调用HAL hwc的set钩子方法
+
+
+
+###### doDisplayComposition
+
+做完合成, 且识别出要显示的区域swapRegion
+
+主要步骤:
+
+* 根据系统的特性, 如果支持局部刷新, dirtyRegion就跟原来一样的大, 如果不支持局部刷新, dirtyRegion就跟屏幕一样大
+* doComposeSurfaces(hw, dirtyRegion); ( 后面详细分析 )
+* 更新DisplayDevice的swapRegion
+
+
+
+###### doComposeSurfaces
+
+主要步骤:
+
+* 如果有SurfaceView, 就打洞, 利用OpenGL函数, glScissor(left, bottom, right, top)
+* 遍历hw->getVisibleLayersSortedByZ(), 调用每个Layer的draw ( 后面详细分析 )
+* 等遍历完, mSurface已经被画完了, 只需等待调用eglSwapBuffers来渲染了
+
+
+
+###### Layer::draw
+
+主要步骤:
+
+* 准备好Texture, mSurfaceFlingerConsumer->bindTextureImage()
+* 绑定和配置纹理, engine.setupLayerTexturing(mTexture)
+* 渲染顶点和纹理, drawWithOpenGL(hw, clip, useIdentityTransform)
 
 
 
 ### 小结
 
 
-
-## 回顾HWComposer的flow
-
-
-
-
-
-### 小结
 
 
 
